@@ -419,3 +419,73 @@ def test_rate_limiter_honors_env_delays(monkeypatch):
     limiter = server.SharedSearchRateLimiter()
     assert limiter.min_delay == 0.1
     assert limiter.max_delay == 0.2
+
+
+def test_private_display_candidates_skip_display_zero_and_taken_numbers(tmp_path):
+    socket_dir = tmp_path / ".X11-unix"
+    socket_dir.mkdir()
+    (socket_dir / "X99").touch()
+    (tmp_path / ".X100-lock").touch()
+
+    candidates = server._private_display_candidates(socket_dir=socket_dir, lock_dir=tmp_path)
+
+    assert [next(candidates) for _ in range(2)] == [101, 102]
+
+
+class _FakeXServer:
+    """Stand-in for an Xvfb/Xephyr Popen that reports through -displayfd."""
+
+    _next_pid = 40000
+
+    def __init__(self, command, report):
+        self.command = command
+        _FakeXServer._next_pid += 1
+        self.pid = _FakeXServer._next_pid
+        self.stdout = type("Stdout", (), {"readline": lambda _self: report})()
+
+    def poll(self):
+        return None
+
+
+def _patch_x_server_start(monkeypatch, reports):
+    started = []
+
+    def popen(command, **kwargs):
+        if command[0] not in ("Xvfb", "Xephyr"):
+            raise OSError("not needed in this test")
+        proc = _FakeXServer(command, reports[len(started)])
+        started.append(proc)
+        return proc
+
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+    monkeypatch.setattr(server.select, "select", lambda r, w, x, timeout: (r, [], []))
+    monkeypatch.setattr(
+        server.subprocess, "run", lambda command, **kwargs: type("Result", (), {"returncode": 0})()
+    )
+    monkeypatch.setattr(server, "_terminate_owned_process", lambda proc, timeout: None)
+    monkeypatch.setattr(server, "_private_display_candidates", lambda **kwargs: iter([99, 100, 101]))
+    return started
+
+
+@pytest.mark.parametrize("start", ["_start_xvfb", "_start_xephyr"])
+def test_x_server_gets_an_explicit_private_display(monkeypatch, start):
+    started = _patch_x_server_start(monkeypatch, ["99\n"])
+    runtime = server.BrowserRuntime()
+
+    display = getattr(runtime, start)(*([":0"] if start == "_start_xephyr" else []))
+
+    assert display == ":99"
+    assert started[0].command[1] == ":99"
+
+
+@pytest.mark.parametrize("start", ["_start_xvfb", "_start_xephyr"])
+def test_x_server_moves_on_when_another_server_wins_the_display(monkeypatch, start):
+    # An X server that loses the race for its display lock exits without
+    # reporting a number on -displayfd.
+    started = _patch_x_server_start(monkeypatch, ["", "100\n"])
+    runtime = server.BrowserRuntime()
+
+    display = getattr(runtime, start)(*([":0"] if start == "_start_xephyr" else []))
+
+    assert display == ":100"
+    assert [proc.command[1] for proc in started] == [":99", ":100"]

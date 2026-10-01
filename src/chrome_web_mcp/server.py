@@ -227,6 +227,29 @@ def _terminate_owned_process(proc: subprocess.Popen | None, timeout: float) -> N
             pass
 
 
+X11_SOCKET_DIR = Path("/tmp/.X11-unix")
+X11_LOCK_DIR = Path("/tmp")
+FIRST_PRIVATE_DISPLAY = 99
+DISPLAY_ATTEMPTS = 10
+
+
+def _private_display_candidates(
+    socket_dir: Path = X11_SOCKET_DIR, lock_dir: Path = X11_LOCK_DIR
+):
+    """Yield display numbers that no X server appears to own.
+
+    Xvfb/Xephyr are never left to pick a number with a bare -displayfd: they
+    start at :0 and treat a display as free when /tmp/.X0-lock is missing.
+    Under WSLg the desktop X server runs in another distro, so its lock file is
+    invisible here, and the private server would replace (and on exit delete)
+    the desktop's /tmp/.X11-unix/X0 socket, cutting off every X client on the
+    machine. Starting high and skipping existing sockets avoids that.
+    """
+    for number in itertools.count(FIRST_PRIVATE_DISPLAY):
+        if not (socket_dir / f"X{number}").exists() and not (lock_dir / f".X{number}-lock").exists():
+            yield number
+
+
 def _process_identity(pid: int) -> dict:
     """Identify a process without relying on a reusable PID alone (Linux)."""
     proc_path = Path(f"/proc/{pid}")
@@ -665,24 +688,45 @@ class BrowserRuntime:
         pending.write_text(json.dumps(records))
         pending.replace(PROFILE_DIR / ".owned-processes.json")
 
+    def _spawn_x_server(
+        self, attr: str, command: list[str], env: dict[str, str] | None = None
+    ) -> tuple[subprocess.Popen, str] | None:
+        """Start an X server on an explicit private display.
+
+        Returns the process and its display, or None when no candidate display
+        could be claimed. Raises if the server does not report in time.
+        """
+        name = command[0]
+        for number in itertools.islice(_private_display_candidates(), DISPLAY_ATTEMPTS):
+            proc = subprocess.Popen(
+                [name, f":{number}", *command[1:]],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                start_new_session=True,
+            )
+            setattr(self, attr, proc)
+            self._record_processes()
+            assert proc.stdout is not None
+            ready, _, _ = select.select([proc.stdout], [], [], 10)
+            if not ready:
+                raise RuntimeError(f"{name} did not allocate a display within 10 seconds")
+            if proc.stdout.readline().strip() == str(number):
+                return proc, f":{number}"
+            # The server exits without reporting when it cannot claim the
+            # display, e.g. another MCP process locked it after our check.
+            _terminate_owned_process(proc, 2)
+            setattr(self, attr, None)
+        return None
+
     def _start_xvfb(self) -> str:
-        proc = subprocess.Popen(
-            ["Xvfb", "-displayfd", "1", "-screen", "0", "1365x900x24", "-nolisten", "tcp"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            start_new_session=True,
+        started = self._spawn_x_server(
+            "xvfb", ["Xvfb", "-displayfd", "1", "-screen", "0", "1365x900x24", "-nolisten", "tcp"]
         )
-        self.xvfb = proc
-        self._record_processes()
-        assert proc.stdout is not None
-        ready, _, _ = select.select([proc.stdout], [], [], 10)
-        if not ready:
-            raise RuntimeError("Xvfb did not allocate a display within 10 seconds")
-        number = proc.stdout.readline().strip()
-        if not number.isdigit():
-            raise RuntimeError("Xvfb returned an invalid display number")
-        display = f":{number}"
+        if started is None:
+            raise RuntimeError("Xvfb could not allocate a display")
+        proc, display = started
         for _ in range(30):
             check = subprocess.run(
                 ["xdpyinfo", "-display", display],
@@ -722,7 +766,8 @@ class BrowserRuntime:
         except OSError:
             minimizer = None
         try:
-            proc = subprocess.Popen(
+            started = self._spawn_x_server(
+                "xephyr",
                 [
                     "Xephyr",
                     "-displayfd",
@@ -735,29 +780,17 @@ class BrowserRuntime:
                     "tcp",
                 ],
                 env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                start_new_session=True,
             )
         except Exception:
             _terminate_owned_process(minimizer, 2)
             raise
-        self.xephyr = proc
-        self._record_processes()
-        assert proc.stdout is not None
-        ready, _, _ = select.select([proc.stdout], [], [], 10)
-        if not ready:
-            _terminate_owned_process(minimizer, 2)
-            raise RuntimeError("Xephyr did not allocate a display within 10 seconds")
-        number = proc.stdout.readline().strip()
-        if not number.isdigit():
+        if started is None:
             _terminate_owned_process(minimizer, 2)
             raise RuntimeError(
                 "Xephyr could not allocate a nested display. "
                 "Check DISPLAY and XAUTHORITY access to the desktop X server."
             )
-        display = f":{number}"
+        proc, display = started
         for _ in range(30):
             check = subprocess.run(
                 ["xdpyinfo", "-display", display],
